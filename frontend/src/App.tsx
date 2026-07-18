@@ -1,10 +1,10 @@
 import { createSignal, onMount, onCleanup } from "solid-js";
-import { StartWorker, StopWorker, SetSystemProxy } from "../bindings/changeme/workerservice";
+import { StartWorker, StopWorker } from "../bindings/changeme/workerservice";
 import { Events } from "@wailsio/runtime";
 
 interface AppConfig {
   server?: string;
-  listen?: string;
+  tunName?: string;
   token?: string;
   ip?: string;
   dns?: string;
@@ -14,7 +14,7 @@ interface AppConfig {
 
 function App() {
   const [server, setServer] = createSignal<string>("");
-  const [listenAddr, setListenAddr] = createSignal<string>("127.0.0.1:30000");
+  const [tunName, setTunName] = createSignal<string>("ech0");
   const [token, setToken] = createSignal<string>("");
   const [ip, setIp] = createSignal<string>("saas.sin.fan");
   const [dns, setDns] = createSignal<string>("dns.alidns.com/dns-query");
@@ -22,34 +22,29 @@ function App() {
   const [routingMode, setRoutingMode] = createSignal<string>("bypass_cn");
 
   const [isRunning, setIsRunning] = createSignal<boolean>(false);
-  const [systemProxyEnabled, setSystemProxyEnabled] = createSignal<boolean>(false);
-  const [logOutput, setLogOutput] = createSignal<string>("");
+
+  const MAX_LOG_LINES = 500;
+
+  const [logs, setLogs] = createSignal<string[]>([]);
+
+  const logOutput = () => logs().join("");
 
   let logRef: HTMLDivElement | undefined;
 
   const appendLog = (msg: string) => {
-    setLogOutput((prev) => prev + msg);
-    if (logRef) {
-      logRef.scrollTop = logRef.scrollHeight;
-    }
-  };
-
-  const toggleProxy = async (enable: boolean) => {
-    try {
-      const errMsg = await SetSystemProxy(
-        enable,
-        listenAddr(),
-        routingMode()
-      );
-      if (errMsg) {
-        appendLog(`[系统] 代理设置失败: ${errMsg}\n`);
-        return;
+    setLogs((prev: any) => {
+      const newLogs = [...prev, msg];
+      if (newLogs.length > MAX_LOG_LINES) {
+        return newLogs.slice(newLogs.length - MAX_LOG_LINES);
       }
-      setSystemProxyEnabled(enable);
-      appendLog(`[系统] ${enable ? "已设置" : "已关闭"}系统代理\n`);
-    } catch (e) {
-      appendLog(`[系统] 代理设置请求失败: ${e}\n`);
-    }
+      return newLogs;
+    });
+
+    requestAnimationFrame(() => {
+      if (logRef) {
+        logRef.scrollTop = logRef.scrollHeight;
+      }
+    });
   };
 
   const executeStart = async () => {
@@ -61,7 +56,7 @@ function App() {
     try {
       const errMsg = await StartWorker(
         server(),
-        listenAddr(),
+        tunName(),
         token(),
         ip(),
         dns(),
@@ -75,9 +70,7 @@ function App() {
       }
 
       setIsRunning(true);
-      appendLog(`[系统] 已启动代理服务器\n`);
-
-      await toggleProxy(true);
+      appendLog(`[系统] 已启动 TUN 代理，网卡: ${tunName()}\n`);
     } catch (e) {
       appendLog(`[系统] 启动请求失败: ${e}\n`);
     }
@@ -89,7 +82,7 @@ function App() {
       try {
         const config: AppConfig = JSON.parse(saved);
         if (config.server) setServer(config.server);
-        if (config.listen) setListenAddr(config.listen);
+        if (config.tunName) setTunName(config.tunName);
         if (config.token) setToken(config.token);
         if (config.ip) setIp(config.ip);
         if (config.dns) setDns(config.dns);
@@ -115,9 +108,6 @@ function App() {
     const unlistenFinished = Events.On("process-finished", () => {
       appendLog("[系统] 进程已停止。\n");
       setIsRunning(false);
-      if (systemProxyEnabled()) {
-        toggleProxy(false);
-      }
     });
 
     onCleanup(() => {
@@ -130,7 +120,7 @@ function App() {
   const saveConfig = () => {
     const config: AppConfig = {
       server: server(),
-      listen: listenAddr(),
+      tunName: tunName(),
       token: token(),
       ip: ip(),
       dns: dns(),
@@ -164,7 +154,7 @@ function App() {
           </button>
           <button
             class="px-4 py-2 bg-white text-slate-500 border border-slate-200 rounded-lg text-sm font-medium hover:bg-slate-50 transition-colors"
-            onClick={() => setLogOutput("")}
+            onClick={() => setLogs([])}
           >
             清空日志
           </button>
@@ -196,13 +186,13 @@ function App() {
             />
           </div>
           <div class="flex flex-col sm:flex-row sm:items-center gap-2">
-            <label class="sm:w-32 text-sm font-medium text-slate-600">监听地址:</label>
+            <label class="sm:w-32 text-sm font-medium text-slate-600">TUN 名称:</label>
             <input
               type="text"
               class="flex-1 px-3 py-2 bg-slate-50 border border-slate-200 rounded-lg text-sm focus:outline-none focus:border-blue-500 focus:bg-white transition-all disabled:opacity-60 disabled:cursor-not-allowed"
-              placeholder="例如: 127.0.0.1:30000"
-              value={listenAddr()}
-              onInput={(e) => setListenAddr(e.currentTarget.value)}
+              placeholder="例如: ech0"
+              value={tunName()}
+              onInput={(e) => setTunName(e.currentTarget.value)}
               disabled={isRunning()}
             />
           </div>

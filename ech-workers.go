@@ -15,7 +15,6 @@ import (
 	"net"
 	"net/http"
 	"net/url"
-	"os"
 	"reflect"
 	"sort"
 	"strings"
@@ -28,7 +27,6 @@ import (
 // ======================== 全局参数 ========================
 
 var (
-	listenAddr  string
 	serverAddr  string
 	serverIP    string
 	token       string
@@ -46,6 +44,9 @@ var (
 	// 中国IP列表（IPv6）
 	chinaIPV6RangesMu sync.RWMutex
 	chinaIPV6Ranges   []ipRangeV6
+
+	globalDoHClient *http.Client
+	globalDoHMu     sync.Mutex
 )
 
 // ipRange 表示一个IPv4 IP范围
@@ -89,16 +90,38 @@ func (cw *chanWriter) Write(p []byte) (n int, err error) {
 // ======================== 核心入口 ========================
 
 // StartProxy 替代了原先的 main() 函数
-func StartProxy(ctx context.Context, server, listen, tokenStr, ip, dns, ech, routing string, logChan chan string) error {
+func StartProxy(ctx context.Context, server, tunName, tokenStr, ip, dns, ech, routing string, logChan chan string) error {
 	// 1. 设置日志重定向
 	log.SetOutput(&chanWriter{ch: logChan})
-	log.SetFlags(log.Ltime) // 仅保留时间前缀，让前端展示更干净
+	log.SetFlags(log.Ltime)
+
+	// --- 新增：强制将 serverIP 解析为真实 IP，防止 route add 失败 ---
+	if ip == "" || net.ParseIP(ip) == nil {
+		// 如果传入的 serverIP 是域名（如 saas.sin.fan）
+		host := ip
+		if host == "" {
+			host, _, _, _ = parseServerAddr(server) // 从 server 取 host
+		}
+
+		ips, err := net.LookupIP(host)
+		if err == nil && len(ips) > 0 {
+			for _, resolveIP := range ips {
+				if resolveIP.To4() != nil {
+					ip = resolveIP.String()
+					log.Printf("[系统] 服务器域名解析为真实 IPv4: %s", ip)
+					break
+				}
+			}
+		} else {
+			log.Printf("[警告] 无法解析服务器域名: %s", host)
+		}
+	}
+	// -------------------------------------------------------------
 
 	// 2. 初始化全局参数
 	serverAddr = server
-	listenAddr = listen
 	token = tokenStr
-	serverIP = ip
+	serverIP = ip // 现在这里一定是一个 真实的 IP 地址
 	dnsServer = dns
 	echDomain = ech
 	routingMode = routing
@@ -149,8 +172,12 @@ func StartProxy(ctx context.Context, server, listen, tokenStr, ip, dns, ech, rou
 		routingMode = "global"
 	}
 
-	// 3. 启动代理监听 (传递 Context 用于优雅退出)
-	go runProxyServer(ctx, listenAddr)
+	// 3. 启动 TUN 代理 (传递 Context 用于优雅退出)
+	go func() {
+		if err := runTUNProxy(ctx, tunName); err != nil {
+			log.Printf("[TUN] 启动失败: %v", err)
+		}
+	}()
 
 	return nil
 }
@@ -239,7 +266,7 @@ func isChinaIP(ipStr string) bool {
 
 // compareIPv6 比较两个IPv6地址，返回 -1, 0, 或 1
 func compareIPv6(a, b [16]byte) int {
-	for i := 0; i < 16; i++ {
+	for i := range 16 {
 		if a[i] < b[i] {
 			return -1
 		} else if a[i] > b[i] {
@@ -249,40 +276,7 @@ func compareIPv6(a, b [16]byte) int {
 	return 0
 }
 
-// downloadIPList 下载IP列表文件
-func downloadIPList(url, filePath string) error {
-	log.Printf("[下载] 正在下载 IP 列表: %s", url)
-
-	client := &http.Client{
-		Timeout: 30 * time.Second,
-	}
-
-	resp, err := client.Get(url)
-	if err != nil {
-		return fmt.Errorf("下载失败: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("下载失败: HTTP %d", resp.StatusCode)
-	}
-
-	// 读取内容
-	content, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return fmt.Errorf("读取下载内容失败: %w", err)
-	}
-
-	// 保存到文件
-	if err := os.WriteFile(filePath, content, 0644); err != nil {
-		return fmt.Errorf("保存文件失败: %w", err)
-	}
-
-	log.Printf("[下载] 已保存到: %s", filePath)
-	return nil
-}
-
-// loadChinaIPList 从程序目录加载中国IP列表
+// loadChinaIPList 从嵌入资源中加载中国 IPv4 地址段，用于 bypass_cn 分流模式。
 func loadChinaIPList() error {
 	// 1. 直接从 main.go 定义的 ipData 读取
 	data, err := ipData.ReadFile("chn_ip.txt")
@@ -430,20 +424,6 @@ func shouldBypassProxy(targetHost string) bool {
 	return false
 }
 
-func isNormalCloseError(err error) bool {
-	if err == nil {
-		return false
-	}
-	if err == io.EOF {
-		return true
-	}
-	errStr := err.Error()
-	return strings.Contains(errStr, "use of closed network connection") ||
-		strings.Contains(errStr, "broken pipe") ||
-		strings.Contains(errStr, "connection reset by peer") ||
-		strings.Contains(errStr, "normal closure")
-}
-
 // ======================== ECH 支持 ========================
 
 const typeHTTPS = 65
@@ -467,11 +447,13 @@ func prepareECH() error {
 	return nil
 }
 
+// refreshECH 刷新 ECH 配置（通常在连接失败时调用）。
 func refreshECH() error {
 	log.Printf("[ECH] 刷新配置...")
 	return prepareECH()
 }
 
+// getECHList 返回当前缓存的 ECH 配置（线程安全）。
 func getECHList() ([]byte, error) {
 	echListMu.RLock()
 	defer echListMu.RUnlock()
@@ -481,6 +463,7 @@ func getECHList() ([]byte, error) {
 	return echList, nil
 }
 
+// buildTLSConfigWithECH 构建带 ECH 支持的 TLS 配置。
 func buildTLSConfigWithECH(serverName string, echList []byte) (*tls.Config, error) {
 	roots, err := x509.SystemCertPool()
 	if err != nil {
@@ -529,7 +512,7 @@ func setECHConfig(config *tls.Config, echList []byte) error {
 	return nil
 }
 
-// queryHTTPSRecord 通过 DoH 查询 HTTPS 记录
+// queryHTTPSRecord 通过 DoH 查询域名的 HTTPS 记录，用于获取 ECH 配置。
 func queryHTTPSRecord(domain, dnsServer string) (string, error) {
 	dohURL := dnsServer
 	if !strings.HasPrefix(dohURL, "https://") && !strings.HasPrefix(dohURL, "http://") {
@@ -578,10 +561,11 @@ func queryDoH(domain, dohURL string) (string, error) {
 	return parseDNSResponse(body)
 }
 
+// buildDNSQuery 构建标准的 DNS 查询报文。
 func buildDNSQuery(domain string, qtype uint16) []byte {
 	query := make([]byte, 0, 512)
 	query = append(query, 0x00, 0x01, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00)
-	for _, label := range strings.Split(domain, ".") {
+	for label := range strings.SplitSeq(domain, ".") {
 		query = append(query, byte(len(label)))
 		query = append(query, []byte(label)...)
 	}
@@ -589,6 +573,7 @@ func buildDNSQuery(domain string, qtype uint16) []byte {
 	return query
 }
 
+// parseDNSResponse 解析 DNS 响应报文，提取 HTTPS 记录中的 ECH 参数。
 func parseDNSResponse(response []byte) (string, error) {
 	if len(response) < 12 {
 		return "", errors.New("响应过短")
@@ -638,6 +623,7 @@ func parseDNSResponse(response []byte) (string, error) {
 	return "", nil
 }
 
+// parseHTTPSRecord 从 HTTPS 记录中解析 ECH 配置（Base64 编码）。
 func parseHTTPSRecord(data []byte) string {
 	if len(data) < 2 {
 		return ""
@@ -676,42 +662,53 @@ func queryDoHForProxy(dnsQuery []byte) ([]byte, error) {
 		return nil, err
 	}
 
-	// 构建 DoH URL
 	dohURL := fmt.Sprintf("https://cloudflare-dns.com:%s/dns-query", port)
 
-	echBytes, err := getECHList()
-	if err != nil {
-		return nil, fmt.Errorf("获取 ECH 配置失败: %w", err)
-	}
+	// 【关键修复 2】复用 http.Client，利用 HTTP/2 多路复用，极大提升解析速度并防封锁
+	globalDoHMu.Lock()
+	if globalDoHClient == nil {
+		echBytes, err := getECHList()
+		if err != nil {
+			globalDoHMu.Unlock()
+			return nil, fmt.Errorf("获取 ECH 配置失败: %w", err)
+		}
 
-	tlsCfg, err := buildTLSConfigWithECH("cloudflare-dns.com", echBytes)
-	if err != nil {
-		return nil, fmt.Errorf("构建 TLS 配置失败: %w", err)
-	}
+		tlsCfg, err := buildTLSConfigWithECH("cloudflare-dns.com", echBytes)
+		if err != nil {
+			globalDoHMu.Unlock()
+			return nil, fmt.Errorf("构建 TLS 配置失败: %w", err)
+		}
 
-	// 创建 HTTP 客户端
-	transport := &http.Transport{
-		TLSClientConfig: tlsCfg,
-	}
+		transport := &http.Transport{
+			TLSClientConfig:   tlsCfg,
+			ForceAttemptHTTP2: true, // 强制开启 HTTP/2 多路复用
+		}
 
-	// 如果指定了 IP，使用自定义 Dialer
-	if serverIP != "" {
-		transport.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
-			_, port, err := net.SplitHostPort(addr)
-			if err != nil {
-				return nil, err
+		// 绑定物理网卡 IP（如果上一轮已定义）
+		if serverIP != "" {
+			transport.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+				_, port, err := net.SplitHostPort(addr)
+				if err != nil {
+					return nil, err
+				}
+				dialer := &net.Dialer{
+					Timeout: 10 * time.Second,
+				}
+				// 假设 localPhysicalIP 在其他文件中声明过，否则可以注释掉这两行
+				if localPhysicalIP != nil {
+					dialer.LocalAddr = &net.TCPAddr{IP: localPhysicalIP, Port: 0}
+				}
+				return dialer.DialContext(ctx, network, net.JoinHostPort(serverIP, port))
 			}
-			dialer := &net.Dialer{
-				Timeout: 10 * time.Second,
-			}
-			return dialer.DialContext(ctx, network, net.JoinHostPort(serverIP, port))
+		}
+
+		globalDoHClient = &http.Client{
+			Transport: transport,
+			Timeout:   10 * time.Second,
 		}
 	}
-
-	client := &http.Client{
-		Transport: transport,
-		Timeout:   10 * time.Second,
-	}
+	client := globalDoHClient
+	globalDoHMu.Unlock()
 
 	// 发送 DoH 请求
 	req, err := http.NewRequest("POST", dohURL, bytes.NewReader(dnsQuery))
@@ -724,6 +721,10 @@ func queryDoHForProxy(dnsQuery []byte) ([]byte, error) {
 
 	resp, err := client.Do(req)
 	if err != nil {
+		// 如果网络断开或连接已死，清空复用池，以便下次重新建立
+		globalDoHMu.Lock()
+		globalDoHClient = nil
+		globalDoHMu.Unlock()
 		return nil, fmt.Errorf("DoH 请求失败: %w", err)
 	}
 	defer resp.Body.Close()
@@ -737,6 +738,7 @@ func queryDoHForProxy(dnsQuery []byte) ([]byte, error) {
 
 // ======================== WebSocket 客户端 ========================
 
+// parseServerAddr 解析服务器地址，返回 host、port、path 和错误信息。
 func parseServerAddr(addr string) (host, port, path string, err error) {
 	path = "/"
 	slashIdx := strings.Index(addr, "/")
@@ -753,6 +755,7 @@ func parseServerAddr(addr string) (host, port, path string, err error) {
 	return host, port, path, nil
 }
 
+// dialWebSocketWithECH 使用 ECH 配置建立 WebSocket 连接，支持自动重试。
 func dialWebSocketWithECH(maxRetries int) (*websocket.Conn, error) {
 	host, port, path, err := parseServerAddr(serverAddr)
 	if err != nil {
@@ -793,7 +796,15 @@ func dialWebSocketWithECH(maxRetries int) (*websocket.Conn, error) {
 				if err != nil {
 					return nil, err
 				}
-				return net.DialTimeout(network, net.JoinHostPort(serverIP, port), 10*time.Second)
+				// --- 新增：同样绑定本地物理 IP ---
+				d := &net.Dialer{
+					Timeout: 10 * time.Second,
+				}
+				// 需要引入 tun.go 中的 localPhysicalIP（在同一个 main 包下可以直接用）
+				if localPhysicalIP != nil {
+					d.LocalAddr = &net.TCPAddr{IP: localPhysicalIP, Port: 0}
+				}
+				return d.Dial(network, net.JoinHostPort(serverIP, port))
 			}
 		}
 
@@ -814,696 +825,4 @@ func dialWebSocketWithECH(maxRetries int) (*websocket.Conn, error) {
 	return nil, errors.New("连接失败，已达最大重试次数")
 }
 
-// ======================== 统一代理服务器 ========================
-
-func runProxyServer(ctx context.Context, addr string) {
-	listener, err := net.Listen("tcp", addr)
-	if err != nil {
-		log.Printf("[系统] 代理监听失败: %v", err)
-		return
-	}
-
-	// 监听 Context 完成信号，用于控制服务的停止
-	go func() {
-		<-ctx.Done()
-		listener.Close()
-		log.Printf("[系统] 收到停止信号，释放监听端口: %s", addr)
-	}()
-
-	log.Printf("[代理] 服务器启动: %s (支持 SOCKS5 和 HTTP)", addr)
-	log.Printf("[代理] 后端服务器: %s", serverAddr)
-	if serverIP != "" {
-		log.Printf("[代理] 使用固定 IP: %s", serverIP)
-	}
-
-	for {
-		conn, err := listener.Accept()
-		if err != nil {
-			// 如果是 ctx.Done 导致的错误，正常退出循环
-			select {
-			case <-ctx.Done():
-				return
-			default:
-				log.Printf("[代理] 接受连接失败: %v", err)
-				continue
-			}
-		}
-
-		go handleConnection(conn)
-	}
-}
-
-func handleConnection(conn net.Conn) {
-	defer conn.Close()
-
-	clientAddr := conn.RemoteAddr().String()
-	conn.SetDeadline(time.Now().Add(30 * time.Second))
-
-	// 读取第一个字节判断协议
-	buf := make([]byte, 1)
-	n, err := conn.Read(buf)
-	if err != nil || n == 0 {
-		return
-	}
-
-	firstByte := buf[0]
-
-	// 使用 switch 判断协议类型
-	switch firstByte {
-	case 0x05:
-		// SOCKS5 协议
-		handleSOCKS5(conn, clientAddr, firstByte)
-	case 'C', 'G', 'P', 'H', 'D', 'O', 'T':
-		// HTTP 协议 (CONNECT, GET, POST, HEAD, DELETE, OPTIONS, TRACE, PUT, PATCH)
-		handleHTTP(conn, clientAddr, firstByte)
-	default:
-		log.Printf("[代理] %s 未知协议: 0x%02x", clientAddr, firstByte)
-	}
-}
-
-// ======================== SOCKS5 处理 ========================
-
-func handleSOCKS5(conn net.Conn, clientAddr string, firstByte byte) {
-	// 验证版本
-	if firstByte != 0x05 {
-		log.Printf("[SOCKS5] %s 版本错误: 0x%02x", clientAddr, firstByte)
-		return
-	}
-
-	// 读取认证方法数量
-	buf := make([]byte, 1)
-	if _, err := io.ReadFull(conn, buf); err != nil {
-		return
-	}
-
-	nmethods := buf[0]
-	methods := make([]byte, nmethods)
-	if _, err := io.ReadFull(conn, methods); err != nil {
-		return
-	}
-
-	// 响应无需认证
-	if _, err := conn.Write([]byte{0x05, 0x00}); err != nil {
-		return
-	}
-
-	// 读取请求
-	buf = make([]byte, 4)
-	if _, err := io.ReadFull(conn, buf); err != nil {
-		return
-	}
-
-	if buf[0] != 5 {
-		return
-	}
-
-	command := buf[1]
-	atyp := buf[3]
-
-	var host string
-	switch atyp {
-	case 0x01: // IPv4
-		buf = make([]byte, 4)
-		if _, err := io.ReadFull(conn, buf); err != nil {
-			return
-		}
-		host = net.IP(buf).String()
-
-	case 0x03: // 域名
-		buf = make([]byte, 1)
-		if _, err := io.ReadFull(conn, buf); err != nil {
-			return
-		}
-		domainBuf := make([]byte, buf[0])
-		if _, err := io.ReadFull(conn, domainBuf); err != nil {
-			return
-		}
-		host = string(domainBuf)
-
-	case 0x04: // IPv6
-		buf = make([]byte, 16)
-		if _, err := io.ReadFull(conn, buf); err != nil {
-			return
-		}
-		host = net.IP(buf).String()
-
-	default:
-		conn.Write([]byte{0x05, 0x08, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00})
-		return
-	}
-
-	// 读取端口
-	buf = make([]byte, 2)
-	if _, err := io.ReadFull(conn, buf); err != nil {
-		return
-	}
-	port := int(buf[0])<<8 | int(buf[1])
-
-	switch command {
-	case 0x01: // CONNECT
-		var target string
-		if atyp == 0x04 {
-			target = fmt.Sprintf("[%s]:%d", host, port)
-		} else {
-			target = fmt.Sprintf("%s:%d", host, port)
-		}
-
-		log.Printf("[SOCKS5] %s -> %s", clientAddr, target)
-
-		if err := handleTunnel(conn, target, clientAddr, modeSOCKS5, ""); err != nil {
-			if !isNormalCloseError(err) {
-				log.Printf("[SOCKS5] %s 代理失败: %v", clientAddr, err)
-			}
-		}
-
-	case 0x03: // UDP ASSOCIATE
-		handleUDPAssociate(conn, clientAddr)
-
-	default:
-		conn.Write([]byte{0x05, 0x07, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00})
-		return
-	}
-}
-
-func handleUDPAssociate(tcpConn net.Conn, clientAddr string) {
-	// 创建 UDP 监听器
-	udpAddr, err := net.ResolveUDPAddr("udp", "127.0.0.1:0")
-	if err != nil {
-		log.Printf("[UDP] %s 解析地址失败: %v", clientAddr, err)
-		tcpConn.Write([]byte{0x05, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00})
-		return
-	}
-
-	udpConn, err := net.ListenUDP("udp", udpAddr)
-	if err != nil {
-		log.Printf("[UDP] %s 监听失败: %v", clientAddr, err)
-		tcpConn.Write([]byte{0x05, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00})
-		return
-	}
-
-	// 获取实际监听的端口
-	localAddr := udpConn.LocalAddr().(*net.UDPAddr)
-	port := localAddr.Port
-
-	log.Printf("[UDP] %s UDP ASSOCIATE 监听端口: %d", clientAddr, port)
-
-	// 发送成功响应
-	response := []byte{0x05, 0x00, 0x00, 0x01}
-	response = append(response, 127, 0, 0, 1) // 127.0.0.1
-	response = append(response, byte(port>>8), byte(port&0xff))
-
-	if _, err := tcpConn.Write(response); err != nil {
-		udpConn.Close()
-		return
-	}
-
-	// 启动 UDP 处理
-	stopChan := make(chan struct{})
-	go handleUDPRelay(udpConn, clientAddr, stopChan)
-
-	// 保持 TCP 连接，直到客户端关闭
-	buf := make([]byte, 1)
-	tcpConn.Read(buf)
-
-	close(stopChan)
-	udpConn.Close()
-	log.Printf("[UDP] %s UDP ASSOCIATE 连接关闭", clientAddr)
-}
-
-func handleUDPRelay(udpConn *net.UDPConn, clientAddr string, stopChan chan struct{}) {
-	buf := make([]byte, 65535)
-	for {
-		select {
-		case <-stopChan:
-			return
-		default:
-		}
-
-		udpConn.SetReadDeadline(time.Now().Add(1 * time.Second))
-		n, addr, err := udpConn.ReadFromUDP(buf)
-		if err != nil {
-			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-				continue
-			}
-			return
-		}
-
-		// 解析 SOCKS5 UDP 请求头
-		if n < 10 {
-			continue
-		}
-
-		// SOCKS5 UDP 请求格式:
-		// +----+------+------+----------+----------+----------+
-		// |RSV | FRAG | ATYP | DST.ADDR | DST.PORT |   DATA   |
-		// +----+------+------+----------+----------+----------+
-		// | 2  |  1   |  1   | Variable |    2     | Variable |
-		// +----+------+------+----------+----------+----------+
-
-		data := buf[:n]
-
-		if data[2] != 0x00 { // FRAG 必须为 0
-			continue
-		}
-
-		atyp := data[3]
-		var headerLen int
-		var dstHost string
-		var dstPort int
-
-		switch atyp {
-		case 0x01: // IPv4
-			if n < 10 {
-				continue
-			}
-			dstHost = net.IP(data[4:8]).String()
-			dstPort = int(data[8])<<8 | int(data[9])
-			headerLen = 10
-
-		case 0x03: // 域名
-			if n < 5 {
-				continue
-			}
-			domainLen := int(data[4])
-			if n < 7+domainLen {
-				continue
-			}
-			dstHost = string(data[5 : 5+domainLen])
-			dstPort = int(data[5+domainLen])<<8 | int(data[6+domainLen])
-			headerLen = 7 + domainLen
-
-		case 0x04: // IPv6
-			if n < 22 {
-				continue
-			}
-			dstHost = net.IP(data[4:20]).String()
-			dstPort = int(data[20])<<8 | int(data[21])
-			headerLen = 22
-
-		default:
-			continue
-		}
-
-		udpData := data[headerLen:]
-		target := fmt.Sprintf("%s:%d", dstHost, dstPort)
-
-		// 检查是否是 DNS 查询（端口 53）
-		if dstPort == 53 {
-			log.Printf("[UDP-DNS] %s -> %s (DoH 查询)", clientAddr, target)
-			go handleDNSQuery(udpConn, addr, udpData, data[:headerLen])
-		} else {
-			log.Printf("[UDP] %s -> %s (暂不支持非 DNS UDP)", clientAddr, target)
-			// 这里可以扩展支持其他 UDP 流量
-		}
-	}
-}
-
-func handleDNSQuery(udpConn *net.UDPConn, clientAddr *net.UDPAddr, dnsQuery []byte, socks5Header []byte) {
-	// 通过 DoH 查询（使用重命名后的函数）
-	dnsResponse, err := queryDoHForProxy(dnsQuery)
-	if err != nil {
-		log.Printf("[UDP-DNS] DoH 查询失败: %v", err)
-		return
-	}
-
-	// 构建 SOCKS5 UDP 响应
-	response := make([]byte, 0, len(socks5Header)+len(dnsResponse))
-	response = append(response, socks5Header...)
-	response = append(response, dnsResponse...)
-
-	// 发送响应
-	_, err = udpConn.WriteToUDP(response, clientAddr)
-	if err != nil {
-		log.Printf("[UDP-DNS] 发送响应失败: %v", err)
-		return
-	}
-
-	log.Printf("[UDP-DNS] DoH 查询成功，响应 %d 字节", len(dnsResponse))
-}
-
-// ======================== HTTP 处理 ========================
-
-func handleHTTP(conn net.Conn, clientAddr string, firstByte byte) {
-	// 将第一个字节放回缓冲区
-	reader := bufio.NewReader(io.MultiReader(
-		strings.NewReader(string(firstByte)),
-		conn,
-	))
-
-	// 读取 HTTP 请求行
-	requestLine, err := reader.ReadString('\n')
-	if err != nil {
-		return
-	}
-
-	parts := strings.Fields(requestLine)
-	if len(parts) < 3 {
-		return
-	}
-
-	method := parts[0]
-	requestURL := parts[1]
-	httpVersion := parts[2]
-
-	// 读取所有 headers
-	headers := make(map[string]string)
-	var headerLines []string
-	for {
-		line, err := reader.ReadString('\n')
-		if err != nil {
-			return
-		}
-		line = strings.TrimRight(line, "\r\n")
-		if line == "" {
-			break
-		}
-		headerLines = append(headerLines, line)
-		if idx := strings.Index(line, ":"); idx > 0 {
-			key := strings.TrimSpace(line[:idx])
-			value := strings.TrimSpace(line[idx+1:])
-			headers[strings.ToLower(key)] = value
-		}
-	}
-
-	switch method {
-	case "CONNECT":
-		// HTTPS 隧道代理 - 需要发送 200 响应
-		log.Printf("[HTTP-CONNECT] %s -> %s", clientAddr, requestURL)
-		if err := handleTunnel(conn, requestURL, clientAddr, modeHTTPConnect, ""); err != nil {
-			if !isNormalCloseError(err) {
-				log.Printf("[HTTP-CONNECT] %s 代理失败: %v", clientAddr, err)
-			}
-		}
-
-	case "GET", "POST", "PUT", "DELETE", "HEAD", "OPTIONS", "PATCH", "TRACE":
-		// HTTP 代理 - 直接转发，不发送 200 响应
-		log.Printf("[HTTP-%s] %s -> %s", method, clientAddr, requestURL)
-
-		var target string
-		var path string
-
-		if strings.HasPrefix(requestURL, "http://") {
-			// 解析完整 URL
-			urlWithoutScheme := strings.TrimPrefix(requestURL, "http://")
-			idx := strings.Index(urlWithoutScheme, "/")
-			if idx > 0 {
-				target = urlWithoutScheme[:idx]
-				path = urlWithoutScheme[idx:]
-			} else {
-				target = urlWithoutScheme
-				path = "/"
-			}
-		} else {
-			// 相对路径，从 Host header 获取
-			target = headers["host"]
-			path = requestURL
-		}
-
-		if target == "" {
-			conn.Write([]byte("HTTP/1.1 400 Bad Request\r\n\r\n"))
-			return
-		}
-
-		// 添加默认端口
-		if !strings.Contains(target, ":") {
-			target += ":80"
-		}
-
-		// 重构 HTTP 请求（去掉完整 URL，使用相对路径）
-		var requestBuilder strings.Builder
-		requestBuilder.WriteString(fmt.Sprintf("%s %s %s\r\n", method, path, httpVersion))
-
-		// 写入 headers（过滤掉 Proxy-Connection）
-		for _, line := range headerLines {
-			key := strings.Split(line, ":")[0]
-			keyLower := strings.ToLower(strings.TrimSpace(key))
-			if keyLower != "proxy-connection" && keyLower != "proxy-authorization" {
-				requestBuilder.WriteString(line)
-				requestBuilder.WriteString("\r\n")
-			}
-		}
-		requestBuilder.WriteString("\r\n")
-
-		// 如果有请求体，需要读取并附加
-		if contentLength := headers["content-length"]; contentLength != "" {
-			var length int
-			fmt.Sscanf(contentLength, "%d", &length)
-			if length > 0 && length < 10*1024*1024 { // 限制 10MB
-				body := make([]byte, length)
-				if _, err := io.ReadFull(reader, body); err == nil {
-					requestBuilder.Write(body)
-				}
-			}
-		}
-
-		firstFrame := requestBuilder.String()
-
-		// 使用 modeHTTPProxy 模式（不发送 200 响应）
-		if err := handleTunnel(conn, target, clientAddr, modeHTTPProxy, firstFrame); err != nil {
-			if !isNormalCloseError(err) {
-				log.Printf("[HTTP-%s] %s 代理失败: %v", method, clientAddr, err)
-			}
-		}
-
-	default:
-		log.Printf("[HTTP] %s 不支持的方法: %s", clientAddr, method)
-		conn.Write([]byte("HTTP/1.1 405 Method Not Allowed\r\n\r\n"))
-	}
-}
-
-// ======================== 通用隧道处理 ========================
-
-// 代理模式常量
-const (
-	modeSOCKS5      = 1 // SOCKS5 代理
-	modeHTTPConnect = 2 // HTTP CONNECT 隧道
-	modeHTTPProxy   = 3 // HTTP 普通代理（GET/POST等）
-)
-
-func handleTunnel(conn net.Conn, target, clientAddr string, mode int, firstFrame string) error {
-	// 解析目标地址
-	targetHost, _, err := net.SplitHostPort(target)
-	if err != nil {
-		targetHost = target
-	}
-
-	// 检查是否应该绕过代理（直连）
-	if shouldBypassProxy(targetHost) {
-		log.Printf("[分流] %s -> %s (直连，绕过代理)", clientAddr, target)
-		return handleDirectConnection(conn, target, clientAddr, mode, firstFrame)
-	}
-
-	// 走代理
-	log.Printf("[分流] %s -> %s (通过代理)", clientAddr, target)
-	wsConn, err := dialWebSocketWithECH(2)
-	if err != nil {
-		sendErrorResponse(conn, mode)
-		return err
-	}
-	defer wsConn.Close()
-
-	var mu sync.Mutex
-
-	// 保活
-	stopPing := make(chan bool)
-	go func() {
-		ticker := time.NewTicker(10 * time.Second)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ticker.C:
-				mu.Lock()
-				wsConn.WriteMessage(websocket.PingMessage, nil)
-				mu.Unlock()
-			case <-stopPing:
-				return
-			}
-		}
-	}()
-	defer close(stopPing)
-
-	conn.SetDeadline(time.Time{})
-
-	// 如果没有预设的 firstFrame，尝试读取第一帧数据（仅 SOCKS5）
-	if firstFrame == "" && mode == modeSOCKS5 {
-		_ = conn.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
-		buffer := make([]byte, 32768)
-		n, _ := conn.Read(buffer)
-		_ = conn.SetReadDeadline(time.Time{})
-		if n > 0 {
-			firstFrame = string(buffer[:n])
-		}
-	}
-
-	// 发送连接请求
-	connectMsg := fmt.Sprintf("CONNECT:%s|%s", target, firstFrame)
-	mu.Lock()
-	err = wsConn.WriteMessage(websocket.TextMessage, []byte(connectMsg))
-	mu.Unlock()
-	if err != nil {
-		sendErrorResponse(conn, mode)
-		return err
-	}
-
-	// 等待响应
-	_, msg, err := wsConn.ReadMessage()
-	if err != nil {
-		sendErrorResponse(conn, mode)
-		return err
-	}
-
-	response := string(msg)
-	if strings.HasPrefix(response, "ERROR:") {
-		sendErrorResponse(conn, mode)
-		return errors.New(response)
-	}
-	if response != "CONNECTED" {
-		sendErrorResponse(conn, mode)
-		return fmt.Errorf("意外响应: %s", response)
-	}
-
-	// 发送成功响应（根据模式不同而不同）
-	if err := sendSuccessResponse(conn, mode); err != nil {
-		return err
-	}
-
-	log.Printf("[代理] %s 已连接: %s", clientAddr, target)
-
-	// 双向转发
-	done := make(chan bool, 2)
-
-	// Client -> Server
-	go func() {
-		buf := make([]byte, 32768)
-		for {
-			n, err := conn.Read(buf)
-			if err != nil {
-				mu.Lock()
-				wsConn.WriteMessage(websocket.TextMessage, []byte("CLOSE"))
-				mu.Unlock()
-				done <- true
-				return
-			}
-
-			mu.Lock()
-			err = wsConn.WriteMessage(websocket.BinaryMessage, buf[:n])
-			mu.Unlock()
-			if err != nil {
-				done <- true
-				return
-			}
-		}
-	}()
-
-	// Server -> Client
-	go func() {
-		for {
-			mt, msg, err := wsConn.ReadMessage()
-			if err != nil {
-				done <- true
-				return
-			}
-
-			if mt == websocket.TextMessage {
-				if string(msg) == "CLOSE" {
-					done <- true
-					return
-				}
-			}
-
-			if _, err := conn.Write(msg); err != nil {
-				done <- true
-				return
-			}
-		}
-	}()
-
-	<-done
-	log.Printf("[代理] %s 已断开: %s", clientAddr, target)
-	return nil
-}
-
-// ======================== 直连处理 ========================
-
-// handleDirectConnection 处理直连（绕过代理）
-func handleDirectConnection(conn net.Conn, target, clientAddr string, mode int, firstFrame string) error {
-	// 解析目标地址
-	host, port, err := net.SplitHostPort(target)
-	if err != nil {
-		// 如果没有端口，根据模式添加默认端口
-		host = target
-		if mode == modeHTTPConnect || mode == modeHTTPProxy {
-			port = "443"
-		} else {
-			port = "80"
-		}
-		target = net.JoinHostPort(host, port)
-	}
-
-	// 直接连接到目标
-	targetConn, err := net.DialTimeout("tcp", target, 10*time.Second)
-	if err != nil {
-		sendErrorResponse(conn, mode)
-		return fmt.Errorf("直连失败: %w", err)
-	}
-	defer targetConn.Close()
-
-	// 发送成功响应
-	if err := sendSuccessResponse(conn, mode); err != nil {
-		return err
-	}
-
-	// 如果有预设的第一帧数据，先发送
-	if firstFrame != "" {
-		if _, err := targetConn.Write([]byte(firstFrame)); err != nil {
-			return err
-		}
-	}
-
-	// 双向转发
-	done := make(chan bool, 2)
-
-	// Client -> Target
-	go func() {
-		io.Copy(targetConn, conn)
-		done <- true
-	}()
-
-	// Target -> Client
-	go func() {
-		io.Copy(conn, targetConn)
-		done <- true
-	}()
-
-	<-done
-	log.Printf("[分流] %s 直连已断开: %s", clientAddr, target)
-	return nil
-}
-
-// ======================== 响应辅助函数 ========================
-
-func sendErrorResponse(conn net.Conn, mode int) {
-	switch mode {
-	case modeSOCKS5:
-		conn.Write([]byte{0x05, 0x04, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00})
-	case modeHTTPConnect, modeHTTPProxy:
-		conn.Write([]byte("HTTP/1.1 502 Bad Gateway\r\n\r\n"))
-	}
-}
-
-func sendSuccessResponse(conn net.Conn, mode int) error {
-	switch mode {
-	case modeSOCKS5:
-		// SOCKS5 成功响应
-		_, err := conn.Write([]byte{0x05, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00})
-		return err
-	case modeHTTPConnect:
-		// HTTP CONNECT 需要发送 200 响应
-		_, err := conn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
-		return err
-	case modeHTTPProxy:
-		// HTTP GET/POST 等不需要发送响应，直接转发目标服务器的响应
-		return nil
-	}
-	return nil
-}
+// 旧的 SOCKS5/HTTP 代理服务器代码已移除，替换为 TUN 模式（见 tun.go）
