@@ -37,6 +37,11 @@ func runCmdStdout(name string, args ...string) ([]byte, error) {
 	return cmd.Output()
 }
 
+// tunPlatformDeviceName 归一化设备名。wintun 对名字无额外约束，原样返回。
+func tunPlatformDeviceName(name string) string {
+	return name
+}
+
 // configureTUN 给 TUN 网卡配置 IP 地址和路由。
 func configureTUN(tunName, serverIP string) error {
 	// 1. 保存原默认网关（用于退出时恢复）
@@ -83,7 +88,7 @@ func configureTUN(tunName, serverIP string) error {
 }
 
 // cleanupTUN 恢复路由和 IP 配置，确保原网关不丢失。
-func cleanupTUN(tunName string) {
+func cleanupTUN(tunName, serverIP string) {
 	// 1. 删除全局路由
 	runCmd("netsh", "interface", "ipv4", "delete", "route", "0.0.0.0/1", tunName)
 	runCmd("netsh", "interface", "ipv6", "delete", "route", "::/1", tunName)

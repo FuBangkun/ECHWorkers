@@ -8,10 +8,8 @@ import (
 	"log"
 	"net"
 	"runtime"
-	"sync"
 	"time"
 
-	"github.com/gorilla/websocket"
 	"golang.zx2c4.com/wireguard/tun"
 	"gvisor.dev/gvisor/pkg/buffer"
 	"gvisor.dev/gvisor/pkg/tcpip"
@@ -31,25 +29,35 @@ const (
 	nicID  = 1
 )
 
-var localPhysicalIP net.IP // 本机物理网卡 IP，用于防止路由死循环
-
 // tunOffset 返回平台相关的 TUN 数据包偏移量。
+// wireguard/tun 各平台对 Read/Write 的 offset 有不同硬性要求：
+//   - windows: wintun 需要 4 字节地址族前缀空间，由调用方写入 AF 标记；
+//   - darwin:  utun 的 Read/Write 要求 offset ≥ 4（模块在 [offset-4:offset]
+//     自行写入地址族标记，包体从 offset 开始）；
+//   - linux:   CreateTUN 固定启用 IFF_VNET_HDR，Write 会在 [offset-10:offset]
+//     预留并填充 virtio_net_hdr（10 字节），因此必须 offset ≥ 10。
 func tunOffset() int {
-	if runtime.GOOS == "windows" {
+	switch runtime.GOOS {
+	case "windows", "darwin":
 		return 4
+	case "linux":
+		return 10
+	default:
+		return 0
 	}
-	return 0
 }
 
 // runTUNProxy 创建 TUN 虚拟网卡，启动 gVisor 用户态协议栈，拦截并转发 TCP 流量。
-func runTUNProxy(ctx context.Context, tunName string) error {
+func runTUNProxy(ctx context.Context, rt *proxyRuntime, tunName string) error {
 	offset := tunOffset()
 
-	conn, err := net.Dial("udp", "8.8.8.8:53")
-	if err := extractWintunDLL(); err == nil {
-		localPhysicalIP = conn.LocalAddr().(*net.UDPAddr).IP
+	// 获取本机物理网卡 IP，用于绑定出站连接，防止路由死循环
+	if conn, err := net.Dial("udp", "8.8.8.8:53"); err == nil {
+		rt.localIP = conn.LocalAddr().(*net.UDPAddr).IP
 		conn.Close()
-		log.Printf("[TUN] 已获取本机物理网卡 IP: %s (用于防死循环)", localPhysicalIP.String())
+		log.Printf("[TUN] 已获取本机物理网卡 IP: %s (用于防死循环)", rt.localIP.String())
+	} else {
+		log.Printf("[TUN] 警告: 获取本机物理网卡 IP 失败: %v", err)
 	}
 
 	// 1. 提取 Wintun DLL（Windows 需要）
@@ -57,7 +65,8 @@ func runTUNProxy(ctx context.Context, tunName string) error {
 		return fmt.Errorf("提取 Wintun DLL 失败: %w", err)
 	}
 
-	// 2. 创建 TUN 设备
+	// 2. 创建 TUN 设备（各平台对设备名有不同约束，见各平台实现）
+	tunName = tunPlatformDeviceName(tunName)
 	tunDev, err := tun.CreateTUN(tunName, tunMTU)
 	if err != nil {
 		return fmt.Errorf("创建 TUN 设备失败: %w", err)
@@ -68,7 +77,7 @@ func runTUNProxy(ctx context.Context, tunName string) error {
 	log.Printf("[TUN] 虚拟网卡已创建: %s, MTU: %d", realName, tunMTU)
 
 	// 配置 IP 和路由
-	if err := configureTUN(realName, serverIP); err != nil {
+	if err := configureTUN(realName, rt.cfg.ServerIP); err != nil {
 		return fmt.Errorf("配置 TUN 失败: %w", err)
 	}
 
@@ -120,7 +129,7 @@ func runTUNProxy(ctx context.Context, tunName string) error {
 	// 8. TCP 转发器
 	tcpForwarder := tcp.NewForwarder(s, 0, 1024, func(r *tcp.ForwarderRequest) {
 		id := r.ID()
-		go handleTCPForward(r, id)
+		go handleTCPForward(rt, r, id)
 	})
 	s.SetTransportProtocolHandler(tcp.ProtocolNumber, tcpForwarder.HandlePacket)
 
@@ -160,7 +169,7 @@ func runTUNProxy(ctx context.Context, tunName string) error {
 			copy(dnsQuery, rawPacket[headerLen:])
 
 			// 此时的 dnsQuery 是完美纯净的 DNS 请求
-			go handleDNSViaDoH(tunDev, id, dnsQuery)
+			go rt.handleDNSViaDoH(tunDev, id, dnsQuery)
 			return true
 		}
 		// 非 DNS 包不处理
@@ -170,7 +179,8 @@ func runTUNProxy(ctx context.Context, tunName string) error {
 	// 10. TUN → gVisor
 	go func() {
 		// 【安全修复】将 readBuf 扩大到 65536 (64KB)，防止 Windows 巨型数据包(LSO)导致数组越界崩溃
-		readBuf := make([]byte, 65536)
+		// 再加上平台偏移量预留（linux 需 10 字节 vnet 头空间）
+		readBuf := make([]byte, offset+65536)
 		for {
 			select {
 			case <-ctx.Done():
@@ -258,12 +268,12 @@ func runTUNProxy(ctx context.Context, tunName string) error {
 	log.Printf("[TUN] 用户态协议栈已启动，等待流量...")
 	<-ctx.Done()
 	log.Printf("[TUN] 正在停止...")
-	cleanupTUN(realName)
+	cleanupTUN(realName, rt.cfg.ServerIP)
 	return nil
 }
 
 // handleTCPForward 处理 gVisor 拦截到的 TCP 连接。
-func handleTCPForward(r *tcp.ForwarderRequest, id stack.TransportEndpointID) {
+func handleTCPForward(rt *proxyRuntime, r *tcp.ForwarderRequest, id stack.TransportEndpointID) {
 	destIP := net.IP(id.LocalAddress.AsSlice()).String()
 	destPort := id.LocalPort
 	clientAddr := fmt.Sprintf("%s:%d", net.IP(id.RemoteAddress.AsSlice()), id.RemotePort)
@@ -271,17 +281,17 @@ func handleTCPForward(r *tcp.ForwarderRequest, id stack.TransportEndpointID) {
 
 	log.Printf("[TCP] %s -> %s", clientAddr, target)
 
-	if shouldBypassProxy(destIP) {
+	if rt.shouldBypassProxy(destIP) {
 		log.Printf("[分流] %s -> %s (直连)", clientAddr, target)
-		handleDirectTUNForward(r, target, clientAddr)
+		handleDirectTUNForward(rt, r, target, clientAddr)
 	} else {
 		log.Printf("[分流] %s -> %s (通过代理)", clientAddr, target)
-		handleWebSocketTUNForward(r, target, clientAddr)
+		handleWebSocketTUNForward(rt, r, target, clientAddr)
 	}
 }
 
 // handleDirectTUNForward 直连转发（绕过代理）。
-func handleDirectTUNForward(r *tcp.ForwarderRequest, target, clientAddr string) {
+func handleDirectTUNForward(rt *proxyRuntime, r *tcp.ForwarderRequest, target, clientAddr string) {
 	var wq waiter.Queue
 	ep, tcpErr := r.CreateEndpoint(&wq)
 	if tcpErr != nil {
@@ -293,12 +303,12 @@ func handleDirectTUNForward(r *tcp.ForwarderRequest, target, clientAddr string) 
 	conn := gonet.NewTCPConn(&wq, ep)
 	defer conn.Close()
 
-	// --- 新增：绑定物理网卡 IP，强制流量走物理网卡，防止再次进入 TUN ---
+	// --- 绑定物理网卡 IP，强制流量走物理网卡，防止再次进入 TUN ---
 	dialer := &net.Dialer{
 		Timeout: 10 * time.Second,
 	}
-	if localPhysicalIP != nil {
-		dialer.LocalAddr = &net.TCPAddr{IP: localPhysicalIP, Port: 0}
+	if rt.localIP != nil {
+		dialer.LocalAddr = &net.TCPAddr{IP: rt.localIP, Port: 0}
 	}
 
 	remoteConn, err := dialer.Dial("tcp", target)
@@ -317,15 +327,10 @@ func handleDirectTUNForward(r *tcp.ForwarderRequest, target, clientAddr string) 
 	log.Printf("[TCP] %s 直连已断开: %s", clientAddr, target)
 }
 
-// handleWebSocketTUNForward 通过 WebSocket 转发 TCP 连接。
-func handleWebSocketTUNForward(r *tcp.ForwarderRequest, target, clientAddr string) {
-	wsConn, err := dialWebSocketWithECH(2)
-	if err != nil {
-		log.Printf("[TCP] WebSocket 连接失败: %v", err)
-		return
-	}
-	defer wsConn.Close()
-
+// handleWebSocketTUNForward 通过 mux 会话转发 TCP 连接。
+func handleWebSocketTUNForward(rt *proxyRuntime, r *tcp.ForwarderRequest, target, clientAddr string) {
+	// 先创建端点：后续任何失败路径都会经 defer 关闭端点，
+	// 客户端立即收到 RST，而不是干等到自身超时。
 	var wq waiter.Queue
 	ep, tcpErr := r.CreateEndpoint(&wq)
 	if tcpErr != nil {
@@ -337,96 +342,39 @@ func handleWebSocketTUNForward(r *tcp.ForwarderRequest, target, clientAddr strin
 	conn := gonet.NewTCPConn(&wq, ep)
 	defer conn.Close()
 
-	var mu sync.Mutex
-
-	stopPing := make(chan bool)
-	go func() {
-		ticker := time.NewTicker(10 * time.Second)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ticker.C:
-				mu.Lock()
-				wsConn.WriteMessage(websocket.PingMessage, nil)
-				mu.Unlock()
-			case <-stopPing:
-				return
-			}
-		}
-	}()
-	defer close(stopPing)
-
-	connectMsg := fmt.Sprintf("CONNECT:%s|", target)
-	mu.Lock()
-	err = wsConn.WriteMessage(websocket.TextMessage, []byte(connectMsg))
-	mu.Unlock()
+	// 在 mux 会话池上打开流：多条流复用同一条 ECH+TLS+WS 长连接，
+	// 新连接零握手开销；会话失效时 open 内部会自动换会话重试。
+	stream, err := rt.muxPool.open(target)
 	if err != nil {
+		log.Printf("[TCP] 打开复用流失败: %v", err)
 		return
 	}
-
-	_, msg, err := wsConn.ReadMessage()
-	if err != nil {
-		return
-	}
-
-	if string(msg) != "CONNECTED" {
-		log.Printf("[TCP] 服务端拒绝连接: %s", string(msg))
-		return
-	}
+	defer stream.Close()
 
 	log.Printf("[TCP] %s 代理已建立: %s", clientAddr, target)
 
 	done := make(chan bool, 2)
-
-	go func() {
-		buf := make([]byte, 32768)
-		for {
-			n, readErr := conn.Read(buf)
-			if readErr != nil {
-				mu.Lock()
-				wsConn.WriteMessage(websocket.TextMessage, []byte("CLOSE"))
-				mu.Unlock()
-				done <- true
-				return
-			}
-			mu.Lock()
-			writeErr := wsConn.WriteMessage(websocket.BinaryMessage, buf[:n])
-			mu.Unlock()
-			if writeErr != nil {
-				done <- true
-				return
-			}
-		}
-	}()
-
-	go func() {
-		for {
-			mt, msg, readErr := wsConn.ReadMessage()
-			if readErr != nil {
-				done <- true
-				return
-			}
-			if mt == websocket.TextMessage && string(msg) == "CLOSE" {
-				done <- true
-				return
-			}
-			if _, writeErr := conn.Write(msg); writeErr != nil {
-				done <- true
-				return
-			}
-		}
-	}()
-
+	go func() { io.Copy(stream, conn); done <- true }()
+	go func() { io.Copy(conn, stream); done <- true }()
 	<-done
 	log.Printf("[TCP] %s 代理已断开: %s", clientAddr, target)
 }
 
 // handleDNSViaDoH 拦截 DNS 查询（UDP 53），通过 DoH 转发，并将响应直接写入 TUN 设备。
-func handleDNSViaDoH(tunDev tun.Device, id stack.TransportEndpointID, dnsQuery []byte) {
-	dnsResp, err := queryDoHForProxy(dnsQuery)
-	if err != nil {
-		log.Printf("[DNS] DoH 查询失败: %v", err)
-		return
+func (rt *proxyRuntime) handleDNSViaDoH(tunDev tun.Device, id stack.TransportEndpointID, dnsQuery []byte) {
+	// 先查缓存：命中直接回包（ID 已重写为本次查询的 ID），免一次 DoH 往返
+	var dnsResp []byte
+	cached, hit := dnsCacheLookup(dnsQuery)
+	if hit {
+		dnsResp = cached
+	} else {
+		resp, err := rt.queryDoHForProxy(dnsQuery)
+		if err != nil {
+			log.Printf("[DNS] DoH 查询失败: %v", err)
+			return
+		}
+		dnsResp = resp
+		dnsCacheStore(dnsQuery, dnsResp)
 	}
 
 	// 构建响应 UDP 包（交换源/目标端口）
@@ -500,59 +448,4 @@ func handleDNSViaDoH(tunDev tun.Device, id stack.TransportEndpointID, dnsQuery [
 	if _, writeErr := tunDev.Write(bufs, offset); writeErr != nil {
 		log.Printf("[DNS] 写入 TUN 失败: %v", writeErr)
 	}
-}
-
-// checksumIP 计算 IPv4 头校验和。
-func checksumIP(header []byte) uint16 {
-	var sum uint32
-	for i := 0; i < len(header); i += 2 {
-		if i == 10 {
-			continue // 跳过校验和字段
-		}
-		sum += uint32(header[i])<<8 | uint32(header[i+1])
-	}
-	for sum>>16 != 0 {
-		sum = (sum & 0xFFFF) + (sum >> 16)
-	}
-	return ^uint16(sum)
-}
-
-// checksumUDP 计算 UDP 校验和（含伪头部）。
-func checksumUDP(srcAddr, dstAddr tcpip.Address, udpHeader, payload []byte) uint16 {
-	var sum uint32
-
-	// 伪头部：源 IP
-	for i := 0; i < len(srcAddr.AsSlice()); i += 2 {
-		sum += uint32(srcAddr.AsSlice()[i])<<8 | uint32(srcAddr.AsSlice()[i+1])
-	}
-	// 伪头部：目标 IP
-	for i := 0; i < len(dstAddr.AsSlice()); i += 2 {
-		sum += uint32(dstAddr.AsSlice()[i])<<8 | uint32(dstAddr.AsSlice()[i+1])
-	}
-	// 伪头部：协议号 (UDP=17)
-	sum += uint32(17)
-	// 伪头部：UDP 长度
-	sum += uint32(len(udpHeader) + len(payload))
-
-	// UDP 头部
-	for i := 0; i < len(udpHeader); i += 2 {
-		sum += uint32(udpHeader[i])<<8 | uint32(udpHeader[i+1])
-	}
-	// UDP 数据
-	for i := 0; i < len(payload)-1; i += 2 {
-		sum += uint32(payload[i])<<8 | uint32(payload[i+1])
-	}
-	if len(payload)%2 == 1 {
-		sum += uint32(payload[len(payload)-1]) << 8
-	}
-
-	for sum>>16 != 0 {
-		sum = (sum & 0xFFFF) + (sum >> 16)
-	}
-	result := ^uint16(sum)
-	if result == 0 {
-		// UDP 校验和为 0 时用 0xFFFF 表示（RFC 768）
-		return 0xFFFF
-	}
-	return result
 }
